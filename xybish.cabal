@@ -47,6 +47,7 @@ cabal-version:       >=1.10
 
 
 executable xybish
+  ghc-options:        -threaded -Wall
   -- .hs or .lhs file containing the Main module.
   main-is:             Main.hs
 
@@ -57,15 +58,28 @@ executable xybish
   -- other-extensions:
 
   -- Other library packages from which modules are imported.
-  build-depends:       base >=4.7 && <4.8,
-                       network-data >=0.5 && <0.6,
+  build-depends:       base >=4.7 && <5,
+                       conduit,
+                       conduit-extra >= 1.1 && < 1.2,
+                       stm-conduit >= 2.6 && < 2.7,
+                       random >= 1.1 && < 1.2,
+                       resourcet >= 1.1 && < 1.2,
+                       --network-data >=0.5 && <0.6,
                        network,
-                       containers,
-                       time >= 1.5,
-                       stm,
-                       attoparsec,
-                       bytestring,
-                       scientific
+                       transformers,
+                       --containers,
+                       time >= 1.5 && < 1.6,
+                       --stm,
+                       --attoparsec,
+                       bytestring
+                       --scientific,
+                       --async,
+                       --scotty,
+                       --mtl,
+                       --text,
+                       --hint,
+                       --vector
+
 
   -- Directories containing source files.
   hs-source-dirs:      src
