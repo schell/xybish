@@ -1,69 +1,68 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 module Tracking.Server where
 
 import Prelude as P
 import Data.Conduit
-import Control.Monad.IO.Class (liftIO,MonadIO)
 import Control.Monad.Trans.Resource
+import Control.Concurrent.Async
+import Control.Monad.STM
 import qualified Data.Conduit.List as CL
-import Data.Conduit.Network.UDP
-import Data.Conduit.Binary
+import Data.Conduit.Network.UDP as UDP
+import Data.Conduit.Binary as CB
+import Data.Conduit.TMChan
 import Data.ByteString.Char8 as BS
---import Web.Scotty.Trans as S
---import GHC.Stats
 import Network.Socket
+import Network.Wai
+import Network.Wai.Handler.Warp as W
+import Network.HTTP.Types
 import System.Exit
 import System.Random
 import Data.Time.Clock
---import Control.Monad
---import Control.Monad.Trans
---import Control.Concurrent.Async
---import Control.Concurrent.STM
---import qualified Data.Text.Lazy as T
---import qualified Data.Map.Strict as M
 
+--------------------------------------------------------------------------------
+-- Logger
+--------------------------------------------------------------------------------
 
---runScotty :: Int -> ScottyT T.Text IO () -> IO ()
---runScotty p r = scottyT p id id r
---
---routes' :: TVar Store -> ScottyT T.Text IO ()
---routes' tvar = do
---    S.get "/" $ html "hello"
---    S.get "/bytes" $ do
---        store <- liftIO $ atomically $ readTVar tvar
---        let entries = M.size store
---
---        bytes <- lift $ fmap currentBytesUsed getGCStats
---        html $ T.pack $ unwords ["> "
---                                ,show bytes
---                                ,"bytes for"
---                                ,show entries
---                                ,"entries."
---                                ]
---
---openServer :: String -> HandlerFunc -> IO Server
---openServer port f = withSocketsDo $ do
---    addrinfos <- getAddrInfo (Just (defaultHints {addrFlags = [AI_PASSIVE]}))
---                             Nothing
---                             (Just port)
---    case addrinfos of
---        (addr:_) -> runSocket addr f
---        _ -> do putStrLn $ "Could not find address info for" ++ port
---                exitFailure
---
---runSocket :: AddrInfo -> HandlerFunc -> IO Server
---runSocket addr f = do
---    sock <- socket (addrFamily addr) Datagram defaultProtocol
---    bindSocket sock $ addrAddress addr
---
---    a <- async $ forever $ do
---        (msg,_,addy) <- recvFrom sock 1024
---        f addy msg
---    return $ Server sock $ cancel a
---
---closeServer :: Server -> IO ()
---closeServer (Server sock io) = io >> close sock
+logger :: Int -> Int -> FilePath -> IO ()
+logger udpPort httpPort file = do
+    chan <- atomically $ newTBMChan 1024
+    _ <- async $ udpLogger chan udpPort
+    _ <- async $ httpLogger chan httpPort
+    runResourceT $ sourceTBMChan chan $$ sinkFile file
+
+--------------------------------------------------------------------------------
+-- TCP
+--------------------------------------------------------------------------------
+
+httpLogger :: TBMChan ByteString -> Int -> IO ()
+httpLogger chan port = runSettings set $ httpApp chan
+    where set = W.setPort port defaultSettings
+
+httpApp :: TBMChan ByteString -> Application
+httpApp chan req respond = do
+    let bs = clearMsg $ BS.drop 1 $ rawPathInfo req
+    runResourceT $ (yield bs >> return ()) $$ sinkTBMChan chan False
+    respond $ responseLBS status200 [] "ok"
+
+--------------------------------------------------------------------------------
+-- UDP
+--------------------------------------------------------------------------------
+
+udpLogger :: TBMChan ByteString -> Int -> IO ()
+udpLogger chan port = runResourceT $
+    udpSource (show port) $$ sinkTBMChan chan False
+
+udpSource :: MonadResource m => ServiceName -> Producer m ByteString
+udpSource port = bracketP create destroy go
+    where create = do s <- getRecvInfo port
+                      uncurry bindSocket s
+                      return s
+          destroy = sClose . fst
+          go s = UDP.sourceSocket (fst s) 1024 =$ (CL.map msg)
+              where msg (Message m _) = clearMsg m
 
 getRecvInfo :: ServiceName -> IO (Socket, SockAddr)
 getRecvInfo port = do
@@ -72,31 +71,13 @@ getRecvInfo port = do
                              (Just port)
     addr <- case addrinfos of
                 (addr:_) -> return addr
-                _ -> do BS.putStrLn $ "Could not find address info for " `BS.append` (pack $ show port)
+                _ -> do BS.putStrLn $ BS.append
+                                        "Could not find address info for "
+                                        (pack $ show port)
                         exitFailure
 
     sock <- socket (addrFamily addr) Datagram defaultProtocol
     return (sock, addrAddress addr)
-
-udpSource :: MonadResource m => ServiceName -> Producer m ByteString
-udpSource port = bracketP create destroy run
-    where create = do s <- getRecvInfo port
-                      uncurry bindSocket s
-                      return s
-          destroy = sClose . fst
-          run s = sourceSocket (fst s) 1024 =$ (CL.map clearMsg) =$ (CL.map (`BS.append` "\n"))
-              where clearMsg (Message msg _) = BS.map (\c -> if c == '\n'
-                                                             then ' '
-                                                             else c)
-                                                      msg
-
-udpToFile :: ServiceName -> FilePath -> IO ()
-udpToFile port file = runResourceT $ (udpSource port $$ sinkFile file)
-
-getMsg :: Source IO ByteString
-getMsg = do
-    str <- liftIO BS.getLine
-    yield $ str
 
 getSendInfo :: HostName -> ServiceName -> IO (Socket, SockAddr)
 getSendInfo host port = do
@@ -107,33 +88,43 @@ getSendInfo host port = do
         _        -> do BS.putStrLn $ "Could not find address info for 31000"
                        exitFailure
 
---sendMsg :: HostName -> ServiceName -> Consumer ByteString IO ()
-sendMsg host port = do
-    (sock,addr) <- liftIO $ getSendInfo host port
-    CL.map (\bs -> Message bs addr) $= sinkToSocket sock
+--------------------------------------------------------------------------------
+-- Testing
+--------------------------------------------------------------------------------
 
-client :: IO ()
-client = getMsg $$ sendMsg "127.0.0.1" "31000"
-    --(sock, addr) <- getSendInfo "127.0.0.1" "31000"
-    --forever $ do ln <- P.getLine
-    --             send' ln sock addr
-    --where send' [] _ _ = return ()
-    --      send' msg s a = do sent <- sendTo s msg a
-    --                         send' (P.drop sent msg) s a
-
-testClient :: HostName -> ServiceName -> NominalDiffTime -> IO ()
-testClient host port seconds = do
+runTestClient :: HostName -> ServiceName -> NominalDiffTime -> IO ()
+runTestClient host port seconds = do
     t           <- getCurrentTime
     (sock,addr) <- getSendInfo host port
     g           <- newStdGen
-    loop' t (randomRs (0,1000) g) sock addr 0
-    where loop' :: UTCTime -> [Int] -> Socket -> SockAddr -> Int -> IO ()
-          loop' t (r:rs) s a n = do send' (show r) s a
-                                    t' <- getCurrentTime
-                                    if addUTCTime seconds t <= t'
-                                    then P.putStrLn $ "Sent " ++ (show n) ++ " messages."
-                                    else loop' t rs s a (n + 1)
-          loop' _ _      _ _ _ = return ()
+    loop' t (randomRs (' ','~') g)
+            (randomRs (1,1024) g :: [Int])
+            sock
+            addr
+            (0 :: Int)
+    where loop' t str is s a n = do
+            send' (P.take (P.head is) str) s a
+            t' <- getCurrentTime
+            if addUTCTime seconds t <= t'
+            then P.putStrLn $ "Sent " ++ (show n) ++ " messages."
+            else loop' t (P.drop 100 str) (P.drop 1 is) s a (n + 1)
           send' []  _ _ = return ()
           send' msg s a = do sent <- sendTo s msg a
                              send' (P.drop sent msg) s a
+
+linesOfFile :: MonadResource m => FilePath -> Producer m ByteString
+linesOfFile file = sourceFile file $= CB.lines
+
+runFoldFile :: FilePath -> (b -> ByteString -> b) -> b -> IO b
+runFoldFile file f acc = runResourceT $ linesOfFile file $$ CL.fold f acc
+
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+clearMsg :: ByteString -> ByteString
+clearMsg s = (BS.map clearChar s) `BS.append` "\n"
+
+clearChar :: Char -> Char
+clearChar '\n' = ' '
+clearChar c    = c
