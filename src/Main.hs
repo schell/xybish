@@ -3,18 +3,25 @@
 module Main where
 
 import Tracking.Server
-import Servant.API
 
+import Control.Concurrent
+import Control.Concurrent.Async
 import Control.Concurrent.STM
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
-import Data.Time.Clock
-import Data.ByteString.Char8 (ByteString)
-import qualified Data.ByteString.Char8 as B
 
-type AdminAPI = "raw" :> QueryParam "num" Int :> Get '[JSON] [Map UTCTime String]
+runLogger :: MemoryLogger -> IO ()
+runLogger = run M.empty
+    where run m logger = do m' <- readTVarIO $ loggerUser logger
+                            if m' == m
+                            then do threadDelay 10000
+                                    run m' logger
+                            else do print $ M.difference m' m
+                                    run m' logger
 
 main :: IO ()
 main = do
     logger <- memoryLogger 30000 31000
-    return ()
+    a <- async $ runLogger logger
+    _ <- getLine
+    cancel a
+    closeLogger logger
